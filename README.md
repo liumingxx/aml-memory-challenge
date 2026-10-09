@@ -122,9 +122,22 @@ PASSED 24   FAILED 0
 
 ---
 
+## 作者
+
+本参赛系统由两人团队共同完成：
+
+| 成员 | GitHub |
+| --- | --- |
+| 柳明溪 | [@liumingxx](https://github.com/liumingxx) |
+| 符莹莹 | — |
+
+**参赛信息**：赛道 = 文本记忆（Textual Memory）｜组别 = 开源方法榜（Academic / Open-source Methods Leaderboard）
+
+---
+
 ## 方法来源与原创性声明
 
-- 本仓库代码为本次参赛**原创实现**，未复制、封装或改写任何第三方项目、论文代码或开源仓库。
+- 本仓库代码为本次参赛**原创实现**（团队成员：柳明溪、符莹莹），未复制、封装或改写任何第三方项目、论文代码或开源仓库。
 - 检索算法采用公开的经典方法：**BM25**（Robertson & Zaragoza, *The Probabilistic Relevance Framework: BM25 and Beyond*, 2009）与**字符 n-gram（bigram）分词**（中/日/韩文检索的常规做法）。
 - **未使用任何生成式大模型**，因此不涉及平台关于 Add / Search 阶段模型使用的限制（`gpt-4o-mini`）。
 - 未使用任何评测数据训练、微调或分析。

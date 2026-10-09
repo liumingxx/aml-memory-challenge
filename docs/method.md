@@ -3,6 +3,7 @@
 > 参评赛道：文本记忆（Textual Memory）
 > 参评组别：开源方法榜（Open-source Methods）
 > 系统版本：v0.1（BM25 基线版）
+> 参赛团队：柳明溪、符莹莹（两人团队）
 
 ---
 
@@ -80,6 +81,7 @@
 
 | 项目 | 说明 |
 | --- | --- |
+| 作者 | 柳明溪、符莹莹（两人团队，开源方法榜 / 文本记忆赛道） |
 | 代码来源 | 本次参赛原创实现，未复制、封装或改写任何第三方仓库/论文代码 |
 | 引用的公开方法 | BM25（Robertson & Zaragoza, *The Probabilistic Relevance Framework: BM25 and Beyond*, Foundations and Trends in Information Retrieval, 2009）；字符 bigram 分词为中/日/韩文检索的常规做法 |
 | 第三方依赖 | 无。仅使用 Python 标准库 |
