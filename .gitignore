@@ -1,0 +1,25 @@
+# ---- 数据与运行产物（绝不提交）----
+memory.sqlite3
+memory.sqlite3-wal
+memory.sqlite3-shm
+*.sqlite3
+*.log
+
+# ---- 密钥与本地配置（绝不提交）----
+*.env
+.env
+secrets*
+*key*
+!docs/*key*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
