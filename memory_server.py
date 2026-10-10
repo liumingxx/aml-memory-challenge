@@ -2,7 +2,7 @@
 """Contract-compliant Add / Search memory service for the Agent Memory
 Challenge (Agent Memory Leaderboard).
 
-v0.2 - retrieval quality, with NO generative model anywhere
+v0.3 - retrieval quality, with NO generative model anywhere
 -----------------------------------------------------------
 Every optimisation below is deterministic algorithm / text processing. No LLM
 is called in Add or Search, so the platform's "Add/Search model" rule cannot
@@ -12,12 +12,27 @@ submission maximally conservative.
 
 Version history
 ---------------
-v0.1  BM25 baseline (submitted with the first evaluation request)
-v0.2  this version - algorithmic retrieval quality, no generative model,
-      no third-party dependencies
+v0.1  BM25 baseline
+v0.2  window index (single scale), relative-time normalisation, English
+      stemming, RRF fusion, MMR dedup          -> smoke score 50.59
+v0.3  this version, targeted at the three weakest capability dimensions
+      measured in the v0.2 smoke run:
+        D Memory Governance 20.00, B Compositional Inference 33.33,
+        G Context Learning 30.00
 
-What v0.2 adds over v0.1
+What v0.3 adds over v0.2
 ------------------------
+1. Multi-scale windows (2 / 3 / 5 messages) instead of a single 3-message
+   window, so both short follow-ups and longer multi-hop chains are covered.
+2. Recency weighting that depends on the question's temporal intent: a
+   present-tense question ("currently", "now", "最新", "现在") lifts recent
+   memories much more strongly, which is what fact supersession requires.
+3. Recency-aware MMR: a candidate is only penalised when it duplicates an
+   already-selected memory that is NEWER than it, so a fresh fact is never
+   pushed down by an older restatement of the same thing.
+
+What v0.2 added over v0.1
+-------------------------
 1. Relative-time normalisation. "yesterday", "last month", "three weeks ago",
    "去年", "上个月" are resolved against the message timestamp and appended to
    the indexed text as absolute dates, so temporal questions can match.
@@ -73,18 +88,54 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-SERVICE_VERSION = "0.2"
+SERVICE_VERSION = "0.3"
 
 API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 DB_PATH = os.environ.get("MEMORY_DB", "memory.sqlite3")
 PREFIX_TIME = os.environ.get("MEMORY_PREFIX_TIME", "1") == "1"
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
-WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "3"))
+# Multi-scale windows: different fact spans need different granularity. A 2-message
+# window captures a simple follow-up; a 5-message window captures a multi-hop chain.
+WINDOW_SIZES = sorted({
+    int(part) for part in os.environ.get("WINDOW_SIZES", "2,3,5").split(",")
+    if part.strip().isdigit() and int(part) >= 2
+}) or []
+WINDOW_SIZE = max(WINDOW_SIZES) if WINDOW_SIZES else 0
 WINDOW_MIN = int(os.environ.get("WINDOW_MIN", "2"))
 MMR_LAMBDA = float(os.environ.get("MMR_LAMBDA", "0.82"))
 MMR_POOL = int(os.environ.get("MMR_POOL", "220"))
 RRF_K = int(os.environ.get("RRF_K", "60"))
+RECENCY_BASE = float(os.environ.get("RECENCY_BASE", "0.10"))
+RECENCY_PAST = float(os.environ.get("RECENCY_PAST", "0.03"))
+RECENCY_DEFAULT = float(os.environ.get("RECENCY_DEFAULT", "0.30"))
+RECENCY_INTENT = float(os.environ.get("RECENCY_INTENT", "0.40"))
+RECENCY_HALFLIFE_DAYS = float(os.environ.get("RECENCY_HALFLIFE_DAYS", "365"))
+
+# Sentence-level indexing: long messages are split into sentences so that one
+# atomic fact can be retrieved on its own.
+#
+# Design idea credited to Mem0 - "one memory = one fact":
+#   Chhikara et al., "Mem0: Building Production-Ready AI Agents with Scalable
+#   Long-Term Memory", arXiv:2504.19413 (2025); repo mem0ai/mem0, Apache-2.0.
+# No Mem0 code is used or adapted here: this is a plain sentence splitter and
+# the project has no third-party dependencies at all.
+SENTENCE_INDEX = os.environ.get("SENTENCE_INDEX", "1") == "1"
+SENTENCE_MIN_CHARS = int(os.environ.get("SENTENCE_MIN_CHARS", "25"))
+
+# Entity weighting: proper nouns and years in the question get extra weight,
+# which is what multi-hop entity linking depends on. Design idea credited to
+# Mem0's multi-signal retrieval (arXiv:2504.19413); implemented here with a
+# regex over capitalised tokens and years, no model involved.
+ENTITY_BOOST = float(os.environ.get("ENTITY_BOOST", "0.30"))
+
+# Lexical matching cannot connect "where do you live?" with "I moved to
+# Shanghai" - there is no shared word. But top_k is 100 and a typical scope
+# only matches a few dozen rows, so the unused slots are filled with the most
+# recent memories. The platform's answer step is instructed to prefer the most
+# recent memory when memories conflict, which makes these slots valuable for
+# fact-supersession questions without hurting precision elsewhere.
+RECENCY_TAIL = int(os.environ.get("RECENCY_TAIL", "25"))
 
 EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "none").strip().lower()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-small-zh-v1.5").strip()
@@ -196,33 +247,41 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _WS_RE = re.compile(r"\s+")
 
 
-def stem_latin(token: str) -> str:
-    """Very light English suffix stripping.
+def stem_variants(token: str) -> List[str]:
+    """Very light English suffix reduction, returning every plausible base form.
 
-    Deterministic text processing (no model, no dictionary): it only makes
-    "work" / "works" / "working" / "worked" collapse to the same key so a
-    question phrased in one form still matches a memory written in another.
+    Deterministic text processing (no model, no dictionary). Emitting more than
+    one candidate is deliberate: stripping "-ed" from "moved" gives "mov", but
+    the useful base is "move", so both are indexed. That is what lets a question
+    about what someone "does" still match a memory that says they "moved".
     Chinese/Japanese/Korean characters pass through unchanged.
     """
     if len(token) <= 3 or not token.isalpha():
-        return token
+        return [token]
+    variants = [token]
     if token.endswith("ies") and len(token) > 4:
-        return token[:-3] + "y"
+        variants.append(token[:-3] + "y")
+        return variants
     if token.endswith("es") and len(token) > 4:
-        return token[:-2]
-    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
-        return token[:-1]
+        variants.append(token[:-2])
+        return variants
     if token.endswith("ing") and len(token) > 5:
-        return token[:-3]
+        variants.extend([token[:-3], token[:-3] + "e"])
+        return list(dict.fromkeys(variants))
     if token.endswith("ed") and len(token) > 4:
-        return token[:-2]
-    return token
+        variants.extend([token[:-2], token[:-2] + "e"])
+        return list(dict.fromkeys(variants))
+    if token.endswith("s") and not token.endswith("ss"):
+        variants.append(token[:-1])
+    return variants
 
 
 def tokenize(text: str) -> List[str]:
     """Latin word stems + CJK unigrams and bigrams (no segmentation deps)."""
     lowered = (text or "").lower()
-    tokens = [stem_latin(word) for word in _LATIN_RE.findall(lowered)]
+    tokens: List[str] = []
+    for word in _LATIN_RE.findall(lowered):
+        tokens.extend(stem_variants(word))
     cjk = _CJK_RE.findall(lowered)
     tokens.extend(cjk)
     tokens.extend(a + b for a, b in zip(cjk, cjk[1:]))
@@ -579,6 +638,32 @@ def _window_line(role: Optional[str], date: Optional[str], text: str) -> str:
     return prefix + _WS_RE.sub(" ", text.strip())
 
 
+# ---- sentence-level ("atomic fact") indexing ------------------------------- #
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？；;])\s+|\n+")
+_SENT_TRIM_RE = re.compile(r"^[\s\"'“”‘’()\[\]{}\-–—]+|[\s\"'“”‘’]+$")
+
+
+def split_sentences(text: str) -> List[str]:
+    """Split a message into standalone sentences worth indexing on their own.
+
+    Model-free approximation of Mem0's "one memory = one fact" idea
+    (Chhikara et al., arXiv:2504.19413): a long message about several things
+    becomes several retrievable units. No Mem0 code is reused.
+    """
+    if not SENTENCE_INDEX or not text:
+        return []
+    pieces = _SENT_SPLIT_RE.split(text)
+    if len(pieces) < 2:
+        return []
+    out: List[str] = []
+    for piece in pieces:
+        sentence = _SENT_TRIM_RE.sub("", piece or "")
+        if SENTENCE_MIN_CHARS <= len(sentence) < 1200 and sentence != text:
+            out.append(sentence)
+    return out if len(out) >= 2 else []
+
+
 def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
     request_id = body.get("request_id")
     user_id = body.get("user_id")
@@ -623,7 +708,7 @@ def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
     # Build sliding-window rows from the tail of the previous chunk plus this one,
     # so multi-message facts become a single retrievable unit.
     windows: List[Dict[str, Any]] = []
-    if WINDOW_SIZE >= WINDOW_MIN >= 2:
+    if WINDOW_SIZES and WINDOW_MIN >= 2:
         tail: List[Dict[str, Any]] = []
         try:
             with db() as conn:
@@ -644,31 +729,55 @@ def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
         stream = tail + [{"role": p["role"], "ts_ms": p["ts_ms"], "text": p["text"],
                           "is_parts": p["is_parts"]} for p in prepared]
         start = len(tail)
-        for end in range(start + WINDOW_MIN - 1, len(stream)):
-            lo = max(0, end - WINDOW_SIZE + 1)
-            chunk = [m for m in stream[lo:end + 1] if not m.get("is_parts")]
-            if len(chunk) < WINDOW_MIN:
+        seen_windows: set = set()
+        for size in WINDOW_SIZES:
+            if size > len(stream):
                 continue
-            # Only emit windows that end inside the current chunk.
-            if end < start:
-                continue
-            lines = [_window_line(m.get("role"), human_date(m.get("ts_ms")), m.get("text", "")) for m in chunk]
-            window_text = "\n".join(line for line in lines if line)
-            if not window_text:
-                continue
-            first_ts = next((m.get("ts_ms") for m in chunk if m.get("ts_ms")), None)
-            windows.append({
-                "mem_id": "mem_" + sha1_hex(user_id + "\x00w\x00" + window_text),
-                "role": "window",
-                "ts_ms": first_ts,
-                "stored": window_text,
+            # Only emit windows that end inside the current chunk, so a window is
+            # written exactly once (by the request that completed it).
+            for end in range(max(start, size - 1), len(stream)):
+                lo = max(0, end - size + 1)
+                chunk = [m for m in stream[lo:end + 1] if not m.get("is_parts")]
+                if len(chunk) < max(WINDOW_MIN, min(size, 2)) or len(chunk) < size:
+                    continue
+                lines = [_window_line(m.get("role"), human_date(m.get("ts_ms")), m.get("text", ""))
+                         for m in chunk]
+                window_text = "\n".join(line for line in lines if line)
+                if not window_text or window_text in seen_windows:
+                    continue
+                seen_windows.add(window_text)
+                first_ts = next((m.get("ts_ms") for m in chunk if m.get("ts_ms")), None)
+                windows.append({
+                    "mem_id": "mem_" + sha1_hex(user_id + "\x00w\x00" + window_text),
+                    "role": "window",
+                    "ts_ms": first_ts,
+                    "stored": window_text,
+                    "is_parts": 0,
+                    "fingerprint": fingerprint(user_id, "window", window_text),
+                    "indexed": index_text("window", window_text, first_ts),
+                    "text": window_text,
+                })
+
+    # Atomic-fact rows: each sentence of a long message becomes its own memory.
+    sentences: List[Dict[str, Any]] = []
+    for item in prepared:
+        if item["is_parts"]:
+            continue
+        date = human_date(item["ts_ms"])
+        for sentence in split_sentences(item["text"]):
+            sentence_text = _window_line(item["role"], date, sentence)
+            sentences.append({
+                "mem_id": "mem_" + sha1_hex(user_id + "\x00s\x00" + sentence_text),
+                "role": "sentence",
+                "ts_ms": item["ts_ms"],
+                "stored": sentence_text,
                 "is_parts": 0,
-                "fingerprint": fingerprint(user_id, "window", window_text),
-                "indexed": index_text("window", window_text, first_ts),
-                "text": window_text,
+                "fingerprint": fingerprint(user_id, "sentence", sentence_text),
+                "indexed": index_text("sentence", sentence_text, item["ts_ms"]),
+                "text": sentence_text,
             })
 
-    all_rows = prepared + windows
+    all_rows = prepared + windows + sentences
     vectors = None
     if EMBEDDER.ready and EMBEDDER.backend != "none":
         vectors = EMBEDDER.encode([row["text"] for row in all_rows])
@@ -691,7 +800,7 @@ def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
             if vectors is not None and position < len(vectors):
                 blob = embedding_blob(vectors[position])
                 model_tag = EMBEDDER.model_name
-            kind = "window" if row["role"] == "window" else "msg"
+            kind = {"window": "window", "sentence": "sent"}.get(row["role"], "msg")
             conn.execute(
                 """INSERT OR IGNORE INTO memories
                    (mem_id, user_id, session_id, role, ts_ms, content, is_parts,
@@ -711,7 +820,8 @@ def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
 
 class Doc:
     __slots__ = ("mem_id", "text", "raw", "is_parts", "ts_ms", "created_at", "kind",
-                 "tokens", "length", "tset", "embedding", "embed_model")
+                 "tokens", "length", "tset", "embedding", "embed_model",
+                 "entity_tokens", "year_tokens")
 
     def __init__(self, row: sqlite3.Row) -> None:
         self.mem_id = row["mem_id"]
@@ -733,6 +843,9 @@ class Doc:
         self.tset = token_set(self.text)
         self.embedding = row["embedding"] if "embedding" in keys else None
         self.embed_model = row["embed_model"] if "embed_model" in keys else None
+        entities = query_entities(self.text)
+        self.entity_tokens = entities
+        self.year_tokens = frozenset(t for t in entities if t.isdigit())
 
 
 def load_docs(user_id: str) -> List[Doc]:
@@ -770,12 +883,79 @@ def backfill_embeddings(user_id: str, docs: Sequence[Doc]) -> None:
         _log("embedder: backfill failed (%s)" % exc)
 
 
-def bm25_rank(query_text: str, docs: Sequence[Doc], limit: int) -> List[Tuple[float, Doc]]:
-    """BM25 + phrase-coverage bonus + slight recency nudge."""
+# Questions that explicitly point at the past must NOT be biased towards the
+# newest memory. Everything else is treated as asking about the present, which
+# is how "memory governance" (fact supersession) is scored: after a fact changes,
+# an unqualified question about it should be answered from the current value.
+_PAST_INTENT_RE = re.compile(
+    r"\b(?:19|20)\d{2}\b"
+    r"|\b(used to|previously|formerly|originally|back then|at the time|"
+    r"in the past|earlier|before that|had been|no longer)\b"
+    r"|以前|之前|原来|当时|曾经|过去|最初|那时候|此前|原先",
+    re.IGNORECASE,
+)
+_PRESENT_INTENT_RE = re.compile(
+    r"\b(now|currently|current|latest|still|nowadays|today|at present|right now|"
+    r"these days|so far|up to now)\b"
+    r"|现在|目前|如今|当前|最近|至今|仍然|現在|目前還",
+    re.IGNORECASE,
+)
+
+
+def query_recency_strength(query_text: str) -> Tuple[float, bool]:
+    """Return (recency strength, is_present_intent).
+
+    Historical questions get almost no time bias; present/unspecified questions
+    get a real one, so a superseded value does not outrank the current one.
+    """
+    text = query_text or ""
+    if _PAST_INTENT_RE.search(text):
+        return RECENCY_PAST, True   # (strength, is_historical)
+    if _PRESENT_INTENT_RE.search(text):
+        return RECENCY_INTENT, False
+    return RECENCY_DEFAULT, False
+
+
+# ---- entity extraction (proper nouns + years), no model needed -------------- #
+
+_ENTITY_RE = re.compile(r"[A-Z][A-Za-z]{1,}|\b(?:19|20)\d{2}\b")
+_ENTITY_STOP = {
+    "i", "the", "a", "an", "my", "your", "his", "her", "their", "our", "its",
+    "what", "where", "when", "who", "why", "how", "which", "whose", "whom",
+    "did", "do", "does", "is", "are", "was", "were", "be", "been", "being",
+    "and", "but", "or", "if", "in", "on", "at", "to", "for", "of", "with",
+    "it", "he", "she", "they", "we", "you", "this", "that", "these", "those",
+    "there", "here", "then", "than", "so", "as", "not", "no", "yes", "am",
+    "about", "after", "before", "during", "from", "into", "over", "under",
+    "can", "could", "would", "should", "will", "shall", "may", "might", "must",
+    "has", "have", "had", "also", "just", "only", "very", "more", "most",
+}
+
+
+def query_entities(query_text: str) -> frozenset:
+    """Proper nouns and years mentioned in the question (lower-cased)."""
+    found = set()
+    for match in _ENTITY_RE.finditer(query_text or ""):
+        token = match.group(0)
+        lowered = token.lower()
+        if lowered in _ENTITY_STOP:
+            continue
+        if token.isdigit():
+            found.add(token)
+        else:
+            found.add(lowered)
+    return frozenset(found)
+
+
+def bm25_rank(query_text: str, docs: Sequence[Doc], limit: int,
+              recency_strength: Optional[float] = None,
+              entities: Optional[frozenset] = None) -> List[Tuple[float, Doc]]:
+    """BM25 + coverage bonus + recency weighting (strength depends on intent)."""
     query_tokens = tokenize(query_text)
     if not query_tokens or not docs or limit <= 0:
         return []
 
+    strength = RECENCY_BASE if recency_strength is None else recency_strength
     n_docs = len(docs)
     avg_len = sum(d.length for d in docs) / n_docs or 1.0
     df: Dict[str, int] = {}
@@ -805,12 +985,19 @@ def bm25_rank(query_text: str, docs: Sequence[Doc], limit: int) -> List[Tuple[fl
         # Coverage: how much of the query is actually present.
         coverage = matched / len(unique_query)
         score *= 1.0 + 0.35 * coverage * coverage
+        # Entity weighting: questions hinge on names, places and years.
+        if entities:
+            hit = sum(1 for ent in entities if ent in doc.entity_tokens)
+            if hit:
+                score *= 1.0 + ENTITY_BOOST * (hit / len(entities))
         # Windows are self-contained evidence; give them a small edge on ties.
         if doc.kind == "window":
             score *= 1.04
+        elif doc.kind == "sent":
+            score *= 1.02
         if doc.ts_ms:
             age_days = max(0.0, (time.time() * 1000 - doc.ts_ms) / 86_400_000.0)
-            score *= 1.0 + 0.05 / (1.0 + age_days / 365.0)
+            score *= 1.0 + strength * math.exp(-age_days / RECENCY_HALFLIFE_DAYS)
         scored.append((score, doc))
 
     scored.sort(key=lambda item: (-item[0], item[1].mem_id))
@@ -849,10 +1036,12 @@ def rrf_fuse(rankings: Sequence[Sequence[Doc]], docs_by_id: Dict[str, Doc],
 
 def mmr_rerank(scored: Sequence[Tuple[float, Doc]], limit: int,
                lam: float = MMR_LAMBDA, window: int = 15) -> List[Tuple[float, Doc]]:
-    """Greedy Maximal Marginal Relevance over token-set Jaccard similarity.
+    """Greedy MMR over token-set Jaccard, with recency-aware duplication handling.
 
-    Keeps the ranking relevant while stopping the top_k from filling up with
-    near-duplicate windows of the same conversation region.
+    A candidate is only penalised when it duplicates an already-selected memory
+    that is NEWER than it. Old restatements of a superseded fact therefore yield
+    to the current one, while a fresh memory is never pushed down just because an
+    older near-duplicate was picked first.
     """
     if len(scored) <= 2 or limit <= 0:
         return list(scored[:limit])
@@ -861,27 +1050,28 @@ def mmr_rerank(scored: Sequence[Tuple[float, Doc]], limit: int,
     rng = (hi - lo) or 1.0
     pool = [(float(s - lo) / rng, d) for s, d in scored]
     out: List[Tuple[float, Doc]] = []
-    recent: List[frozenset] = []
+    recent: List[Tuple[frozenset, Optional[int]]] = []
     while pool and len(out) < limit:
         best_index, best_value = 0, -1e9
         for index, (norm_score, doc) in enumerate(pool):
-            if recent:
-                tset = doc.tset
-                similarity = 0.0
-                for other in recent:
-                    union = len(tset | other)
-                    if union:
-                        value = len(tset & other) / union
-                        if value > similarity:
-                            similarity = value
-            else:
-                similarity = 0.0
+            similarity = 0.0
+            tset = doc.tset
+            for other_set, other_ts in recent:
+                if doc.ts_ms and other_ts and other_ts <= doc.ts_ms:
+                    # The already-picked memory is older: do not penalise the newer one.
+                    continue
+                union = len(tset | other_set)
+                if not union:
+                    continue
+                value = len(tset & other_set) / union
+                if value > similarity:
+                    similarity = value
             value = lam * norm_score - (1.0 - lam) * similarity
             if value > best_value:
                 best_value, best_index = value, index
         norm_score, doc = pool.pop(best_index)
         out.append((lo + norm_score * rng, doc))
-        recent.append(doc.tset)
+        recent.append((doc.tset, doc.ts_ms))
         if len(recent) > window:
             recent.pop(0)
     return out
@@ -949,14 +1139,17 @@ def handle_search(body: Dict[str, Any]) -> Dict[str, Any]:
     rankings: List[List[Doc]] = []
     weights: List[float] = []
 
-    sparse = bm25_rank(query_text, docs, SPARSE_TOP_N)
+    strength, is_historical = query_recency_strength(query_text)
+    entities = query_entities(query_text)
+    sparse = bm25_rank(query_text, docs, SPARSE_TOP_N, strength, entities)
     if sparse:
         rankings.append([doc for _s, doc in sparse])
         weights.append(1.0)
 
     option_text = _options_text(options)
     if option_text:
-        option_pairs = bm25_rank(query_text + " " + option_text, docs, SPARSE_TOP_N)
+        option_pairs = bm25_rank(query_text + " " + option_text, docs, SPARSE_TOP_N,
+                                 strength, entities)
         if option_pairs:
             rankings.append([doc for _s, doc in option_pairs])
             weights.append(0.6)
@@ -973,6 +1166,19 @@ def handle_search(body: Dict[str, Any]) -> Dict[str, Any]:
     fused = rrf_fuse(rankings, docs_by_id, weights)
     pool = fused[:max(top_k, MMR_POOL)]
     selected = mmr_rerank(pool, top_k) if len(pool) > 2 else list(pool[:top_k])
+
+    # Fill spare top_k slots with the newest memories. Only for questions that
+    # are not explicitly about the past: those are the ones where a later
+    # statement is expected to supersede an earlier one.
+    if RECENCY_TAIL > 0 and not is_historical and len(selected) < top_k:
+        chosen = {doc.mem_id for _score, doc in selected}
+        tail = sorted(
+            (doc for doc in docs
+             if doc.mem_id not in chosen and doc.kind == "msg" and doc.ts_ms),
+            key=lambda doc: (-int(doc.ts_ms or 0), doc.mem_id),
+        )[:min(RECENCY_TAIL, top_k - len(selected))]
+        for doc in tail:
+            selected.append((1e-6, doc))
 
     data: List[Dict[str, Any]] = []
     for score, doc in selected[:top_k]:

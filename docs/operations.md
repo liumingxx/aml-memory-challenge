@@ -1,6 +1,6 @@
 # 运行说明
 
-> 系统版本：v0.2 ｜ 环境：Ubuntu 22.04（亦可在任意 Python 3.8+ 环境运行）
+> 系统版本：v0.3 ｜ 环境：Ubuntu 22.04（亦可在任意 Python 3.8+ 环境运行）
 
 ---
 
@@ -82,7 +82,10 @@ systemctl enable --now aml-memory
 | `MEMORY_DB` | `memory.sqlite3` | SQLite 数据文件路径 |
 | `MEMORY_PREFIX_TIME` | `1` | 设为 `1` 时，返回的单条记忆会带上 `[YYYY-MM-DD]` 日期前缀（窗口行自带日期，不重复添加） |
 | `MAX_BODY_BYTES` | 64 MiB | 请求体大小上限（高于契约允许的 30 MiB 载荷） |
-| `WINDOW_SIZE` | `3` | 相邻消息滑动窗口覆盖的消息条数；设为 `0` 关闭窗口索引 |
+| `WINDOW_SIZES` | `2,3,5` | 多尺度窗口的消息条数列表；留空关闭窗口索引 |
+| `RECENCY_BASE` | `0.10` | 默认时效加权强度 |
+| `RECENCY_INTENT` | `0.30` | 问题含现在时标记时的时效加权强度 |
+| `RECENCY_HALFLIFE_DAYS` | `365` | 时效加权的时间常数（天） |
 | `WINDOW_MIN` | `2` | 至少几条消息才生成一个窗口 |
 | `MMR_LAMBDA` | `0.82` | 相关性 vs 去重强度；设为 `1.0` 即关闭去重 |
 | `MMR_POOL` | `220` | 参与去重的候选数量 |

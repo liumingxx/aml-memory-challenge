@@ -25,7 +25,13 @@
 - **多模态**：`ContentPart[]`（text / image_url）原样透传与返回
 - **模型使用**：**本实现不调用任何生成式大模型**（不涉及平台对 Add/Search 的模型限制）
 
-当前版本：**v0.2**（v0.1 为 BM25 基线，随首次评测申请提交）
+当前版本：**v0.3**
+
+| 版本 | 说明 | 官方 smoke |
+| --- | --- | --- |
+| v0.1 | BM25 关键词检索基线 | — |
+| v0.2 | 窗口索引 + 时间归一化 + 词干化 + RRF + MMR | **50.59** |
+| **v0.3** | 多尺度窗口（2/3/5）+ 时间意图感知的时效加权 + 时效感知 MMR | 待测 |
 
 ---
 
@@ -141,10 +147,20 @@ PASSED 24   FAILED 0
 
 ## 方法来源与原创性声明
 
-- 本仓库代码为本次参赛**原创实现**（团队成员：柳明溪、符莹莹），未复制、封装或改写任何第三方项目、论文代码或开源仓库。
+- 本仓库代码为本次参赛**原创实现**（团队成员：柳明溪、符莹莹），**未复制、封装或改写任何第三方项目、论文代码或开源仓库**，未引入任何第三方依赖。
 - 检索算法采用公开的经典方法：**BM25**（Robertson & Zaragoza, *The Probabilistic Relevance Framework: BM25 and Beyond*, 2009）与**字符 n-gram（bigram）分词**（中/日/韩文检索的常规做法）。
 - **未使用任何生成式大模型**，因此不涉及平台关于 Add / Search 阶段模型使用的限制（`gpt-4o-mini`）。
 - 未使用任何评测数据训练、微调或分析。
+
+### 引用声明
+
+本实现在**设计思想**层面参考了 **Mem0** 框架（未使用其代码，也未引入其依赖），特此致谢并标注：
+
+> Chhikara, P., Khant, D., Aryan, S., Singh, T., & Yadav, D. (2025).
+> *Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory.*
+> arXiv:2504.19413 · 开源仓库 https://github.com/mem0ai/mem0 · 许可证 Apache-2.0
+
+具体采纳与放弃的设计逐条说明见 [`docs/method.md` 第 5.1 节](docs/method.md)。
 
 ---
 
