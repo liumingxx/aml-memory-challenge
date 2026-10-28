@@ -2,7 +2,7 @@
 """Contract-compliant Add / Search memory service for the Agent Memory
 Challenge (Agent Memory Leaderboard).
 
-v0.3 - retrieval quality, with NO generative model anywhere
+v0.4 - retrieval quality, with NO generative model anywhere
 -----------------------------------------------------------
 Every optimisation below is deterministic algorithm / text processing. No LLM
 is called in Add or Search, so the platform's "Add/Search model" rule cannot
@@ -88,7 +88,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-SERVICE_VERSION = "0.3"
+SERVICE_VERSION = "0.4"
 
 API_KEY = os.environ.get("MEMORY_API_KEY", "").strip()
 DB_PATH = os.environ.get("MEMORY_DB", "memory.sqlite3")
@@ -111,6 +111,11 @@ RECENCY_PAST = float(os.environ.get("RECENCY_PAST", "0.03"))
 RECENCY_DEFAULT = float(os.environ.get("RECENCY_DEFAULT", "0.30"))
 RECENCY_INTENT = float(os.environ.get("RECENCY_INTENT", "0.40"))
 RECENCY_HALFLIFE_DAYS = float(os.environ.get("RECENCY_HALFLIFE_DAYS", "365"))
+# `timestamp` is an OPTIONAL field in the Add contract. When the platform omits
+# it, insertion order is the only remaining signal that one memory came after
+# another - and for fact supersession that ordering is exactly what matters.
+# Each unit below is "messages apart".
+ORDER_HALFLIFE = float(os.environ.get("ORDER_HALFLIFE", "150"))
 
 # Sentence-level indexing: long messages are split into sentences so that one
 # atomic fact can be retrieved on its own.
@@ -821,10 +826,11 @@ def handle_add(body: Dict[str, Any]) -> Dict[str, Any]:
 class Doc:
     __slots__ = ("mem_id", "text", "raw", "is_parts", "ts_ms", "created_at", "kind",
                  "tokens", "length", "tset", "embedding", "embed_model",
-                 "entity_tokens", "year_tokens")
+                 "entity_tokens", "year_tokens", "order")
 
     def __init__(self, row: sqlite3.Row) -> None:
         self.mem_id = row["mem_id"]
+        self.order = row["ord"] if "ord" in row.keys() else 0
         self.raw = row["content"]
         self.is_parts = bool(row["is_parts"])
         self.ts_ms = row["ts_ms"]
@@ -851,7 +857,7 @@ class Doc:
 def load_docs(user_id: str) -> List[Doc]:
     with db() as conn:
         rows = conn.execute(
-            "SELECT mem_id, user_id, session_id, role, ts_ms, content, is_parts, "
+            "SELECT rowid AS ord, mem_id, user_id, session_id, role, ts_ms, content, is_parts, "
             "       created_at, embedding, embed_model, kind "
             "FROM memories WHERE user_id = ?",
             (user_id,),
@@ -958,6 +964,7 @@ def bm25_rank(query_text: str, docs: Sequence[Doc], limit: int,
     strength = RECENCY_BASE if recency_strength is None else recency_strength
     n_docs = len(docs)
     avg_len = sum(d.length for d in docs) / n_docs or 1.0
+    max_order = max((d.order or 0) for d in docs) or 1
     df: Dict[str, int] = {}
     for doc in docs:
         for token in set(doc.tokens):
@@ -998,6 +1005,10 @@ def bm25_rank(query_text: str, docs: Sequence[Doc], limit: int,
         if doc.ts_ms:
             age_days = max(0.0, (time.time() * 1000 - doc.ts_ms) / 86_400_000.0)
             score *= 1.0 + strength * math.exp(-age_days / RECENCY_HALFLIFE_DAYS)
+        elif doc.order:
+            # No timestamp: fall back to how late this memory arrived.
+            steps_behind = max(0, max_order - doc.order)
+            score *= 1.0 + strength * math.exp(-steps_behind / ORDER_HALFLIFE)
         scored.append((score, doc))
 
     scored.sort(key=lambda item: (-item[0], item[1].mem_id))
@@ -1174,8 +1185,8 @@ def handle_search(body: Dict[str, Any]) -> Dict[str, Any]:
         chosen = {doc.mem_id for _score, doc in selected}
         tail = sorted(
             (doc for doc in docs
-             if doc.mem_id not in chosen and doc.kind == "msg" and doc.ts_ms),
-            key=lambda doc: (-int(doc.ts_ms or 0), doc.mem_id),
+             if doc.mem_id not in chosen and doc.kind == "msg" and (doc.ts_ms or doc.order)),
+            key=lambda doc: (-int(doc.ts_ms or 0), -(doc.order or 0), doc.mem_id),
         )[:min(RECENCY_TAIL, top_k - len(selected))]
         for doc in tail:
             selected.append((1e-6, doc))
